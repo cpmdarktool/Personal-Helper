@@ -11,7 +11,9 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 
-# Загружаем переменные из .env
+# Импортируем клиент для дневника
+from schoolmospy import StudentClient
+
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -23,13 +25,11 @@ if not BOT_TOKEN:
 WEBHOOK_PATH = "/webhook"
 WEBHOOK_URL = f"{WEBHOOK_HOST}{WEBHOOK_PATH}"
 PORT = int(os.getenv("PORT", 10000))
-
-# ВАЖНО: На Render пишем в /tmp, иначе будет ошибка прав доступа
 DB_PATH = "/tmp/mesh_bot.db"
+
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
-# Состояния для FSM (чтобы бот понимал, что мы ждем токен)
 class AuthStates(StatesGroup):
     waiting_for_token = State()
 
@@ -104,17 +104,75 @@ def schedule_kb():
         [InlineKeyboardButton(text=day, callback_data=f"day_{day}")] for day in days
     ] + [[InlineKeyboardButton(text="⬅️ Назад в меню", callback_data="main_menu")]])
 
-# ================= АВТОМАТИЗАЦИЯ (ЗАГЛУШКИ) =================
+# ================= АВТОМАТИЗАЦИЯ (РЕАЛЬНЫЕ ЗАПРОСЫ) =================
 async def parse_mesh_data(token: str, action: str, extra_data: dict = None):
-    await asyncio.sleep(1) # Имитация задержки
-    if action == "homework": return "📚 **Домашнее задание:**\n\n📖 Математика: № 5.12\n📖 Русский: Упр. 234"
-    elif action == "marks": return "📊 **Оценки:**\n\n25.11 | Математика: **5**\n24.11 | Русский: **4**"
-    elif action == "schedule": return f"📅 **Расписание на {extra_data.get('day')}:**\n\n1. Математика\n2. Русский\n3. Английский"
-    elif action == "changes": return "🔔 **Замен нет.** Все по расписанию."
+    try:
+        # Создаем клиент с токеном пользователя
+        client = StudentClient(token=token)
+        
+        # Получаем текущую дату и неделю назад (для запроса оценок и домашки)
+        today = datetime.now().strftime("%Y-%m-%d")
+        week_ago = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d")
+
+        if action == "marks":
+            marks = await client.marks.get(from_date=week_ago, to_date=today)
+            await client.close()
+            
+            if not marks:
+                return "📊 **Оценок за последнюю неделю нет.**"
+            
+            # Формируем красивый текст из полученного списка
+            text = "📊 **Твои оценки:**\n\n"
+            for mark in marks:
+                # В разных версиях API поля могут называться по-разному
+                # Поэтому используем безопасный вывод (если ключа нет - будет пусто)
+                date = mark.get('date', 'Дата неизвестна')
+                subject = mark.get('subject_name', 'Предмет')
+                value = mark.get('mark', '?')
+                text += f"📅 `{date}` | {subject}: **{value}**\n"
+            return text
+
+        elif action == "homework":
+            hw = await client.homeworks.get(from_date=week_ago, to_date=today)
+            await client.close()
+            
+            if not hw:
+                return "📚 **Домашнего задания нет.**"
+            
+            text = "📚 **Домашнее задание:**\n\n"
+            for task in hw:
+                subject = task.get('subject_name', 'Предмет')
+                desc = task.get('description', 'Без описания')
+                text += f"📖 **{subject}**:\n{desc}\n\n"
+            return text
+
+        elif action == "schedule":
+            day = extra_data.get("day")
+            # Ищем ближайшую дату для этого дня недели
+            target_date = datetime.now().strftime("%Y-%m-%d") # Упрощенно - на сегодня
+            lessons = await client.events.get(from_date=target_date, to_date=target_date)
+            await client.close()
+            
+            if not lessons:
+                return f"📅 **На {day} уроков нет.**"
+            
+            text = f"📅 **Расписание на {day}:**\n\n"
+            for i, lesson in enumerate(lessons, 1):
+                subject = lesson.get('subject_name', 'Урок')
+                room = lesson.get('room', '')
+                text += f"{i}. {subject} ({room})\n"
+            return text
+
+        elif action == "changes":
+            return "🔔 **Пока функция в разработке.**"
+
+    except Exception as e:
+        # Если библиотека не поддерживает mosreg или токен не подходит, мы увидим ошибку
+        return f"❌ **Ошибка при запросе к дневнику:**\n\n`{str(e)}`"
+
     return "❓ Неизвестное действие"
 
 # ================= ХЕНДЛЕРЫ =================
-
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message, state: FSMContext):
     await state.clear()
@@ -127,7 +185,6 @@ async def cmd_start(message: types.Message, state: FSMContext):
     else:
         await message.answer(text, reply_markup=start_kb())
 
-# --- О БОТЕ ---
 @dp.callback_query(F.data == "about")
 async def about_bot(callback: CallbackQuery):
     text = "🤖 **О боте:**\nЭтот бот создан для удобного просмотра школьного дневника. Он не передает твои данные третьим лицам."
@@ -145,7 +202,6 @@ async def back_to_start(callback: CallbackQuery, state: FSMContext):
         await callback.message.edit_text("👋 Главное меню:", reply_markup=start_kb())
     await callback.answer()
 
-# --- АВТОРИЗАЦИЯ ---
 @dp.callback_query(F.data == "auth_start")
 async def auth_start(callback: CallbackQuery):
     text = (
@@ -174,19 +230,10 @@ async def auth_wait_token(callback: CallbackQuery, state: FSMContext):
 async def process_token(message: types.Message, state: FSMContext):
     token = message.text.strip()
     
-    # Валидация токена
-    if not token.startswith("eyJ"):
+    if not token.startswith("eyJ") or len(token) < 100:
         await message.answer(
             "❌ **Ошибка!** Это не похоже на токен.\n"
-            "Токен должен начинаться с `eyJ...`. Попробуй скопировать его еще раз.",
-            reply_markup=cancel_kb(),
-            parse_mode="Markdown"
-        )
-        return
-        
-    if len(token) < 100: # Простая проверка на длину
-        await message.answer(
-            "❌ **Ошибка!** Токен слишком короткий. Скорее всего, ты скопировал не всё.",
+            "Токен должен начинаться с `eyJ...` и быть длинным. Попробуй еще раз.",
             reply_markup=cancel_kb(),
             parse_mode="Markdown"
         )
@@ -203,7 +250,6 @@ async def process_token(message: types.Message, state: FSMContext):
     except Exception as e:
         await message.answer(f"❌ Ошибка базы данных: {e}", reply_markup=cancel_kb())
 
-# --- ГЛАВНОЕ МЕНЮ ---
 @dp.callback_query(F.data == "main_menu")
 async def show_main_menu(callback: CallbackQuery):
     await callback.message.edit_text("Главное меню:", reply_markup=main_menu_kb())
@@ -218,7 +264,6 @@ async def logout(callback: CallbackQuery):
     )
     await callback.answer()
 
-# --- РАЗДЕЛЫ МЕНЮ ---
 @dp.callback_query(F.data == "menu_homework")
 async def show_homework(callback: CallbackQuery):
     token = await get_token_from_db(callback.from_user.id)
