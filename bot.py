@@ -16,26 +16,31 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 WEBHOOK_HOST = os.getenv("WEBHOOK_HOST")
 
 if not BOT_TOKEN:
-    raise ValueError("❌ BOT_TOKEN не найден в .env!")
+    raise ValueError("❌ BOT_TOKEN не найден в Environment!")
 
 WEBHOOK_PATH = "/webhook"
 WEBHOOK_URL = f"{WEBHOOK_HOST}{WEBHOOK_PATH}"
-PORT = int(os.getenv("PORT", 8080))
+PORT = int(os.getenv("PORT", 10000))
 
-DB_PATH = "mesh_bot.db"
+# ВАЖНО: На Render пишем в /tmp, иначе будет ошибка прав доступа
+DB_PATH = "/tmp/mesh_bot.db"
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
 # ================= БАЗА ДАННЫХ =================
 async def init_db():
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS users (
-                user_id INTEGER PRIMARY KEY,
-                mesh_token TEXT
-            )
-        """)
-        await db.commit()
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS users (
+                    user_id INTEGER PRIMARY KEY,
+                    mesh_token TEXT
+                )
+            """)
+            await db.commit()
+            print("✅ База данных успешно инициализирована.")
+    except Exception as e:
+        print(f"❌ ОШИБКА БАЗЫ ДАННЫХ: {e}")
 
 async def save_token_to_db(user_id: int, token: str):
     async with aiosqlite.connect(DB_PATH) as db:
@@ -50,10 +55,6 @@ async def get_token_from_db(user_id: int):
 
 # ================= АВТОМАТИЗАЦИЯ (ЗАГЛУШКИ) =================
 async def parse_mesh_data(token: str, action: str, extra_data: dict = None):
-    """
-    Здесь будет логика запросов к МЭШ.
-    Пока возвращает заглушки, чтобы проверить работу бота.
-    """
     await asyncio.sleep(1) # Имитация задержки сети
     
     if action == "homework":
@@ -91,16 +92,22 @@ def back_kb():
 # ================= ХЕНДЛЕРЫ =================
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
-    token = await get_token_from_db(message.from_user.id)
-    if token:
-        await message.answer("С возвращением! Выбери действие:", reply_markup=main_menu_kb())
-    else:
-        await message.answer("👋 Привет! Скинь свой токен МЭШ (начинается на `eyJ...`):")
+    try:
+        token = await get_token_from_db(message.from_user.id)
+        if token:
+            await message.answer("С возвращением! Выбери действие:", reply_markup=main_menu_kb())
+        else:
+            await message.answer("👋 Привет! Скинь свой токен МЭШ (начинается на `eyJ...`):")
+    except Exception as e:
+        print(f"Ошибка в cmd_start: {e}")
 
 @dp.message(F.text.startswith("eyJ"))
 async def save_token(message: types.Message):
-    await save_token_to_db(message.from_user.id, message.text.strip())
-    await message.answer("✅ Токен сохранён! Выбери действие:", reply_markup=main_menu_kb())
+    try:
+        await save_token_to_db(message.from_user.id, message.text.strip())
+        await message.answer("✅ Токен сохранён! Выбери действие:", reply_markup=main_menu_kb())
+    except Exception as e:
+        await message.answer(f"❌ Ошибка при сохранении: {e}")
 
 @dp.callback_query(F.data == "back_to_main")
 async def back_to_main(callback: CallbackQuery):
@@ -153,14 +160,15 @@ async def show_changes(callback: CallbackQuery):
     await callback.message.edit_text(result, reply_markup=back_kb(), parse_mode="Markdown")
     await callback.answer()
 
-# ================= ЗАПУСК (ВЕБХУК ДЛЯ RENDER) =================
+# ================= ЗАПУСК =================
 async def on_startup(app: web.Application):
+    print("⏳ Запуск бота...")
     await init_db()
     if WEBHOOK_HOST:
         await bot.set_webhook(url=WEBHOOK_URL)
-        print(f"Webhook set to {WEBHOOK_URL}")
+        print(f"✅ Webhook установлен: {WEBHOOK_URL}")
     else:
-        print("⚠️ WEBHOOK_HOST не задан. Бот не сможет работать на Render!")
+        print("❌ WEBHOOK_HOST не задан!")
 
 async def on_shutdown(app: web.Application):
     await bot.delete_webhook()
@@ -179,6 +187,7 @@ def main():
     app.router.add_get("/", health)
     
     setup_application(app, dp, bot=bot)
+    print(f"🚀 Сервер запускается на порту {PORT}...")
     web.run_app(app, host="0.0.0.0", port=PORT)
 
 if __name__ == "__main__":
