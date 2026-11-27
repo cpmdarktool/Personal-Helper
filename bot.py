@@ -7,6 +7,8 @@ from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 
 # Загружаем переменные из .env
@@ -26,6 +28,10 @@ PORT = int(os.getenv("PORT", 10000))
 DB_PATH = "/tmp/mesh_bot.db"
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
+
+# Состояния для FSM (чтобы бот понимал, что мы ждем токен)
+class AuthStates(StatesGroup):
+    waiting_for_token = State()
 
 # ================= БАЗА ДАННЫХ =================
 async def init_db():
@@ -53,78 +59,171 @@ async def get_token_from_db(user_id: int):
             row = await cursor.fetchone()
             return row[0] if row else None
 
-# ================= АВТОМАТИЗАЦИЯ (ЗАГЛУШКИ) =================
-async def parse_mesh_data(token: str, action: str, extra_data: dict = None):
-    await asyncio.sleep(1) # Имитация задержки сети
-    
-    if action == "homework":
-        return "📚 **Домашнее задание:**\n\n📖 Математика: № 5.12\n📖 Русский: Упр. 234"
-    elif action == "marks":
-        return "📊 **Оценки:**\n\n25.11 | Математика: **5**\n24.11 | Русский: **4**"
-    elif action == "schedule":
-        day = extra_data.get("day")
-        return f"📅 **Расписание на {day}:**\n\n1. Математика\n2. Русский\n3. Английский"
-    elif action == "changes":
-        return "🔔 **Замен нет.** Все по расписанию."
-    return "❓ Неизвестное действие"
+async def delete_token_from_db(user_id: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("DELETE FROM users WHERE user_id = ?", (user_id,))
+        await db.commit()
 
 # ================= КЛАВИАТУРЫ =================
+def start_kb():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔐 Войти в аккаунт", callback_data="auth_start")],
+        [InlineKeyboardButton(text="ℹ️ О боте", callback_data="about")]
+    ])
+
+def auth_instruction_kb():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="1️⃣ Войти на сайт МЭШ", url="https://authedu.mosreg.ru/")],
+        [InlineKeyboardButton(text="2️⃣ Получить токен", url="https://authedu.mosreg.ru/v2/token/refresh?roleId=1&subsystem=2")],
+        [InlineKeyboardButton(text="✅ Я получил токен", callback_data="auth_wait_token")],
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data="back_to_start")]
+    ])
+
+def cancel_kb():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="back_to_start")]
+    ])
+
 def main_menu_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📚 Домашнее задание", callback_data="menu_homework")],
         [InlineKeyboardButton(text="📊 Оценки", callback_data="menu_marks")],
         [InlineKeyboardButton(text="📅 Расписание", callback_data="menu_schedule")],
         [InlineKeyboardButton(text="🔔 Изменения / Замены", callback_data="menu_changes")],
-        [InlineKeyboardButton(text="🚪 Выйти (удалить токен)", callback_data="logout")]
+        [InlineKeyboardButton(text="🚪 Выйти из аккаунта", callback_data="logout")]
+    ])
+
+def back_kb():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⬅️ Назад в меню", callback_data="main_menu")]
     ])
 
 def schedule_kb():
     days = ["Понедельник", "Вторник", "Среда", "Четверг", "Пятница", "Суббота"]
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text=day, callback_data=f"day_{day}")] for day in days
-    ] + [[InlineKeyboardButton(text="⬅️ Назад", callback_data="back_to_main")]])
+    ] + [[InlineKeyboardButton(text="⬅️ Назад в меню", callback_data="main_menu")]])
 
-def back_kb():
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="⬅️ Назад", callback_data="back_to_main")]
-    ])
+# ================= АВТОМАТИЗАЦИЯ (ЗАГЛУШКИ) =================
+async def parse_mesh_data(token: str, action: str, extra_data: dict = None):
+    await asyncio.sleep(1) # Имитация задержки
+    if action == "homework": return "📚 **Домашнее задание:**\n\n📖 Математика: № 5.12\n📖 Русский: Упр. 234"
+    elif action == "marks": return "📊 **Оценки:**\n\n25.11 | Математика: **5**\n24.11 | Русский: **4**"
+    elif action == "schedule": return f"📅 **Расписание на {extra_data.get('day')}:**\n\n1. Математика\n2. Русский\n3. Английский"
+    elif action == "changes": return "🔔 **Замен нет.** Все по расписанию."
+    return "❓ Неизвестное действие"
 
 # ================= ХЕНДЛЕРЫ =================
+
 @dp.message(Command("start"))
-async def cmd_start(message: types.Message):
-    try:
-        token = await get_token_from_db(message.from_user.id)
-        if token:
-            await message.answer("С возвращением! Выбери действие:", reply_markup=main_menu_kb())
-        else:
-            await message.answer("👋 Привет! Скинь свой токен МЭШ (начинается на `eyJ...`):")
-    except Exception as e:
-        print(f"Ошибка в cmd_start: {e}")
+async def cmd_start(message: types.Message, state: FSMContext):
+    await state.clear()
+    token = await get_token_from_db(message.from_user.id)
+    
+    text = "👋 Привет! Я твой личный помощник для школьного дневника.\n\nВыбери действие:"
+    
+    if token:
+        await message.answer(text, reply_markup=main_menu_kb())
+    else:
+        await message.answer(text, reply_markup=start_kb())
 
-@dp.message(F.text.startswith("eyJ"))
-async def save_token(message: types.Message):
-    try:
-        await save_token_to_db(message.from_user.id, message.text.strip())
-        await message.answer("✅ Токен сохранён! Выбери действие:", reply_markup=main_menu_kb())
-    except Exception as e:
-        await message.answer(f"❌ Ошибка при сохранении: {e}")
+# --- О БОТЕ ---
+@dp.callback_query(F.data == "about")
+async def about_bot(callback: CallbackQuery):
+    text = "🤖 **О боте:**\nЭтот бот создан для удобного просмотра школьного дневника. Он не передает твои данные третьим лицам."
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="back_to_start")]])
+    await callback.message.edit_text(text, reply_markup=kb, parse_mode="Markdown")
+    await callback.answer()
 
-@dp.callback_query(F.data == "back_to_main")
-async def back_to_main(callback: CallbackQuery):
+@dp.callback_query(F.data == "back_to_start")
+async def back_to_start(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    token = await get_token_from_db(callback.from_user.id)
+    if token:
+        await callback.message.edit_text("Главное меню:", reply_markup=main_menu_kb())
+    else:
+        await callback.message.edit_text("👋 Главное меню:", reply_markup=start_kb())
+    await callback.answer()
+
+# --- АВТОРИЗАЦИЯ ---
+@dp.callback_query(F.data == "auth_start")
+async def auth_start(callback: CallbackQuery):
+    text = (
+        "🔐 **Инструкция по входу:**\n\n"
+        "1. Нажми кнопку **«1️⃣ Войти на сайт МЭШ»** и авторизуйся через Госуслуги.\n"
+        "2. Вернись в этот чат и нажми **«2️⃣ Получить токен»**.\n"
+        "3. На открывшейся странице найди длинный текст, который начинается с `eyJ...`.\n"
+        "4. Скопируй **только этот текст** (без кавычек) и отправь его сюда.\n\n"
+        "⚠️ _Если страницы не открываются, выключи VPN._"
+    )
+    await callback.message.edit_text(text, reply_markup=auth_instruction_kb(), parse_mode="Markdown", disable_web_page_preview=True)
+    await callback.answer()
+
+@dp.callback_query(F.data == "auth_wait_token")
+async def auth_wait_token(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(AuthStates.waiting_for_token)
+    await callback.message.edit_text(
+        "📝 Отправь мне свой токен сообщением.\n\n"
+        "Он выглядит как длинная строка, начинающаяся на `eyJ...`.",
+        reply_markup=cancel_kb(),
+        parse_mode="Markdown"
+    )
+    await callback.answer()
+
+@dp.message(AuthStates.waiting_for_token)
+async def process_token(message: types.Message, state: FSMContext):
+    token = message.text.strip()
+    
+    # Валидация токена
+    if not token.startswith("eyJ"):
+        await message.answer(
+            "❌ **Ошибка!** Это не похоже на токен.\n"
+            "Токен должен начинаться с `eyJ...`. Попробуй скопировать его еще раз.",
+            reply_markup=cancel_kb(),
+            parse_mode="Markdown"
+        )
+        return
+        
+    if len(token) < 100: # Простая проверка на длину
+        await message.answer(
+            "❌ **Ошибка!** Токен слишком короткий. Скорее всего, ты скопировал не всё.",
+            reply_markup=cancel_kb(),
+            parse_mode="Markdown"
+        )
+        return
+
+    try:
+        await save_token_to_db(message.from_user.id, token)
+        await state.clear()
+        await message.answer(
+            "✅ **Успешно!** Токен сохранен. Теперь ты можешь пользоваться ботом.",
+            reply_markup=main_menu_kb(),
+            parse_mode="Markdown"
+        )
+    except Exception as e:
+        await message.answer(f"❌ Ошибка базы данных: {e}", reply_markup=cancel_kb())
+
+# --- ГЛАВНОЕ МЕНЮ ---
+@dp.callback_query(F.data == "main_menu")
+async def show_main_menu(callback: CallbackQuery):
     await callback.message.edit_text("Главное меню:", reply_markup=main_menu_kb())
     await callback.answer()
 
 @dp.callback_query(F.data == "logout")
 async def logout(callback: CallbackQuery):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("DELETE FROM users WHERE user_id = ?", (callback.from_user.id,))
-        await db.commit()
-    await callback.message.edit_text("🚪 Токен удалён. Напиши /start.")
+    await delete_token_from_db(callback.from_user.id)
+    await callback.message.edit_text(
+        "🚪 Ты вышел из аккаунта. Токен удален.\nНапиши /start, чтобы начать заново.",
+        reply_markup=start_kb()
+    )
     await callback.answer()
 
+# --- РАЗДЕЛЫ МЕНЮ ---
 @dp.callback_query(F.data == "menu_homework")
 async def show_homework(callback: CallbackQuery):
     token = await get_token_from_db(callback.from_user.id)
+    if not token:
+        return await callback.answer("Сначала войди в аккаунт!", show_alert=True)
     await callback.message.edit_text("⏳ Запрашиваю домашку...")
     result = await parse_mesh_data(token, "homework")
     await callback.message.edit_text(result, reply_markup=back_kb(), parse_mode="Markdown")
@@ -133,6 +232,8 @@ async def show_homework(callback: CallbackQuery):
 @dp.callback_query(F.data == "menu_marks")
 async def show_marks(callback: CallbackQuery):
     token = await get_token_from_db(callback.from_user.id)
+    if not token:
+        return await callback.answer("Сначала войди в аккаунт!", show_alert=True)
     await callback.message.edit_text("⏳ Запрашиваю оценки...")
     result = await parse_mesh_data(token, "marks")
     await callback.message.edit_text(result, reply_markup=back_kb(), parse_mode="Markdown")
@@ -147,6 +248,8 @@ async def ask_day(callback: CallbackQuery):
 async def show_schedule(callback: CallbackQuery):
     day = callback.data.split("_")[1]
     token = await get_token_from_db(callback.from_user.id)
+    if not token:
+        return await callback.answer("Сначала войди в аккаунт!", show_alert=True)
     await callback.message.edit_text(f"⏳ Запрашиваю расписание на {day}...")
     result = await parse_mesh_data(token, "schedule", extra_data={"day": day})
     await callback.message.edit_text(result, reply_markup=back_kb(), parse_mode="Markdown")
@@ -155,6 +258,8 @@ async def show_schedule(callback: CallbackQuery):
 @dp.callback_query(F.data == "menu_changes")
 async def show_changes(callback: CallbackQuery):
     token = await get_token_from_db(callback.from_user.id)
+    if not token:
+        return await callback.answer("Сначала войди в аккаунт!", show_alert=True)
     await callback.message.edit_text("⏳ Проверяю замены...")
     result = await parse_mesh_data(token, "changes")
     await callback.message.edit_text(result, reply_markup=back_kb(), parse_mode="Markdown")
